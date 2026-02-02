@@ -10,7 +10,7 @@ const CLIENT_SECRET = process.env.DIGILOCKER_CLIENT_SECRET || "60647c0b8985"; //
 // Note: User provided 'YOUR_DIGILOCKER_CLIENT_SECRET' previously. 
 // I will use process.env and fallback to a placeholder that needs updating if not set.
 
-const REDIRECT_URI = "https://driveeraserver-1.onrender.com/api/digilocker/callback";
+const REDIRECT_URI = "https://de-server-9fhx.onrender.com/api/digilocker/callback";
 const DIGILOCKER_TOKEN_URL = "https://digilocker.meripehchaan.gov.in/public/oauth2/1/token";
 const DIGILOCKER_USER_URL = "https://digilocker.meripehchaan.gov.in/public/oauth2/1/user";
 const DIGILOCKER_FILES_URL = "https://digilocker.meripehchaan.gov.in/public/oauth2/2/files/issued";
