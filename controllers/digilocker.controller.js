@@ -107,68 +107,32 @@ setInterval(() => {
     }
 }, 60 * 1000);
 
-// PROXY CALLBACK: Deployed on Render, this simple passes the code back to the App.
 exports.handleCallback = async (req, res) => {
     try {
-        const { code, state, error, error_description } = req.query;
+        const { code, state } = req.query;
 
-        console.log("DigiLocker Callback Hit!");
-
-        if (error) {
-            return res.redirect(`driivera://digilocker?status=error&error=${error}&message=${error_description}`);
-        }
+        console.log("DigiLocker Callback Hit at Backend!");
+        // console.log("Code received:", code);
 
         if (!code || !state) {
             return res.redirect('driivera://digilocker?status=error&error=missing_params');
         }
 
-        // Redirect content to App via Deep Link
-        // We do NOT process the token here because the 'state' key is on the User's Local Machine.
-        const deepLink = `driivera://digilocker?status=success&code=${code}&state=${state}`;
-
-        // Return HTML with specific redirect script to ensure mobile browser handles Custom Scheme
-        const html = `
-            <!DOCTYPE html>
-            <html>
-            <body>
-                <p>Redirecting to DriivEra...</p>
-                <script>
-                    window.location.href = "${deepLink}";
-                </script>
-            </body>
-            </html>
-        `;
-        res.send(html);
-
-    } catch (error) {
-        console.error("Callback Proxy Error:", error.message);
-        res.redirect('driivera://digilocker?status=error&error=server_error');
-    }
-};
-
-// EXCHANGE TOKEN: Called by the App (Local) after receiving code from Deep Link
-exports.exchangeToken = async (req, res) => {
-    try {
-        const { code, state } = req.body;
-
-        if (!code || !state) {
-            return res.status(400).json({ success: false, message: "Missing code or state" });
-        }
-
-        // 1. Retrieve Verifier from Local File Store
+        // 1. Retrieve Verifier from File Store
         const store = readStore();
         const session = store[state];
+        const codeVerifier = session ? session.verifier : null;
+        const userId = session ? session.userId : null;
+        const appCallbackUrl = session ? session.callbackUrl : 'driivera://digilocker';
 
-        if (!session) {
-            return res.status(400).json({
-                success: false,
-                message: "Session expired or invalid state. Please try again locally."
-            });
+        if (!codeVerifier || !userId) {
+            console.error("Invalid state or session expired.");
+            // Try to redirect to app anyway if possible, or show error page
+            // Since we don't have the callbackUrl if session is gone, we might have to rely on hardcoded
+            return res.send(`<h3>Error: Session expired or invalid state. Please close and try again.</h3>`);
         }
 
-        const { verifier: codeVerifier, userId } = session;
-
-        // Clean up store
+        // Clean up store (Delete used state)
         delete store[state];
         writeStore(store);
 
@@ -177,9 +141,10 @@ exports.exchangeToken = async (req, res) => {
         tokenParams.append('grant_type', 'authorization_code');
         tokenParams.append('code', code);
         tokenParams.append('client_id', CLIENT_ID);
-        // CRITICAL: Must use the SAME redirect_uri that was used in the AUTHORIZE request
         tokenParams.append('redirect_uri', REDIRECT_URI);
         tokenParams.append('code_verifier', codeVerifier);
+
+        // console.log("Attempting Server-Side Token Exchange...");
 
         // 3. Call DigiLocker Token Endpoint
         const authHeader = 'Basic ' + Buffer.from(CLIENT_ID + ':' + CLIENT_SECRET).toString('base64');
@@ -192,74 +157,175 @@ exports.exchangeToken = async (req, res) => {
         });
 
         const { access_token } = tokenResponse.data;
-        if (!access_token) throw new Error("No access token received");
+
+        if (!access_token) {
+            throw new Error("Token exchange failed - No access token received");
+        }
+
+        // console.log("✅ Access token received");
 
         // 4. Store Token in User DB
+        // console.log("Saving access token for User ID:", userId);
         const user = await User.findByIdAndUpdate(userId, {
             digilockerAccessToken: access_token
         }, { new: true });
 
-        if (!user) throw new Error("User not found");
+        if (!user) {
+            console.error("User not found for ID:", userId);
+            // Fallback error handling
+            return res.redirect('driivera://digilocker?status=error&error=user_not_found');
+        }
 
-        // 5. Fetch Documents (Same logic as before)
+        // 5. Fetch Documents
         let extractedData = { dlNumber: null, panNumber: null };
+
         try {
+            // console.log("Fetching DigiLocker Documents...");
+
             // Get User Profile
             const userProfileResponse = await axios.get(DIGILOCKER_USER_URL, {
                 headers: { 'Authorization': `Bearer ${access_token}` }
             });
-            if (userProfileResponse?.data) {
+            console.log("User Profile Fetched:", userProfileResponse.data?.name);
+
+            // Extract Profile Data
+            if (userProfileResponse && userProfileResponse.data) {
                 extractedData.name = userProfileResponse.data.name;
-                extractedData.dob = userProfileResponse.data.dob;
+                extractedData.dob = userProfileResponse.data.dob; // Usually DD-MM-YYYY
             }
 
             // Get Issued Documents
+            // console.log("Fetching Issued Documents (v2)...");
             const issuedFilesResponse = await axios.get(DIGILOCKER_FILES_URL, {
                 headers: { 'Authorization': `Bearer ${access_token}` }
             });
+            // console.log("Issued Documents Data:", JSON.stringify(issuedFilesResponse.data, null, 2));
+
             const issuedDocuments = issuedFilesResponse.data?.items || [];
+            console.log(`Found ${issuedDocuments.length} issued documents.`);
 
             // --- strict issued document check ---
             if (issuedDocuments.length === 0) {
-                // Retry logic (Simplified for API response)
-                return res.json({
-                    success: false,
-                    status: 'retry_required',
-                    message: "No issued documents found. Please fetch them in DigiLocker app."
-                });
+                console.warn("No ISSUED documents found in DigiLocker account.");
+
+                // increments retry count safely
+                const currentRetries = user.digilockerRetryCount || 0;
+
+                if (currentRetries < 1) {
+                    // Retry allowed (First Failure)
+                    await User.findByIdAndUpdate(userId, {
+                        $inc: { digilockerRetryCount: 1 }
+                    });
+
+                    const redirectUrl = `${appCallbackUrl}${appCallbackUrl.includes('?') ? '&' : '?'}status=retry_required&error=no_issued_docs&message=Please%20fetch%20issued%20documents%20(DL,%20PAN)%20in%20DigiLocker%20app%20from%20issuers%20first.`;
+                    return res.redirect(redirectUrl);
+                } else {
+                    // Retries exhausted
+                    await User.findByIdAndUpdate(userId, {
+                        digilockerStatus: 'MANUAL_UPLOAD'
+                    });
+
+                    const redirectUrl = `${appCallbackUrl}${appCallbackUrl.includes('?') ? '&' : '?'}status=manual_required&error=retries_exhausted&message=We%20could%20not%20find%20issued%20documents.%20Please%20upload%20photos%20manually.`;
+                    return res.redirect(redirectUrl);
+                }
             }
+
+            // Get E-Aadhaar XML
+            // console.log("Fetching E-Aadhaar XML...");
+            // try {
+            //     const eaadharResponse = await axios.get(DIGILOCKER_EAADHAAR_URL, {
+            //         headers: { 'Authorization': `Bearer ${access_token}` }
+            //     });
+            //     console.log("E-Aadhaar Response Data:", eaadharResponse.data);
+            // } catch (err) {
+            //     console.error("Error fetching E-Aadhaar:", err.message);
+            //     if (err.response) console.error("E-Aadhaar Error Response:", err.response.data);
+            // }
 
             const extractDocNumber = (uri, doctype) => {
                 if (!uri) return null;
+                // URI format is typically: <issuer_id>-<doctype>-<doc_number>
+                // This handles cases where the doc_number itself contains hyphens (e.g., DL numbers like MH-12-...)
                 const separator = `-${doctype}-`;
-                if (uri.includes(separator)) return uri.split(separator)[1];
+                if (uri.includes(separator)) {
+                    return uri.split(separator)[1];
+                }
+
+                // Fallback: Use the last part after hyphen if pattern match fails
                 const parts = uri.split('-');
                 return parts[parts.length - 1];
             };
 
             issuedDocuments.forEach(doc => {
-                if (doc.doctype === 'DRVLC') extractedData.dlNumber = extractDocNumber(doc.uri, 'DRVLC');
-                else if (doc.doctype === 'PANCR') extractedData.panNumber = extractDocNumber(doc.uri, 'PANCR');
+                console.log(`Processing Doc: Type=${doc.doctype}, URI=${doc.uri}`);
+                if (doc.doctype === 'DRVLC') {
+                    extractedData.dlNumber = extractDocNumber(doc.uri, 'DRVLC');
+                } else if (doc.doctype === 'PANCR') {
+                    extractedData.panNumber = extractDocNumber(doc.uri, 'PANCR');
+                }
             });
 
-            // Reset retry count
-            await User.findByIdAndUpdate(userId, { digilockerRetryCount: 0, digilockerStatus: 'VERIFIED' });
+            // Reset retry count on success
+            await User.findByIdAndUpdate(userId, {
+                digilockerRetryCount: 0,
+                digilockerStatus: 'VERIFIED'
+            });
 
         } catch (fetchError) {
-            console.error("Error fetching docs:", fetchError);
+            console.error("Error fetching DigiLocker documents:", fetchError.message);
         }
 
-        // Return Data needed for Frontend Verification
-        res.json({
-            success: true,
-            access_token,
-            extractedData
+        // 6. Create Session for App Retrieval
+        const sessionId = crypto.randomBytes(16).toString('hex');
+
+
+
+        sessionStore.set(sessionId, {
+            accessToken: access_token,
+            extractedData: extractedData,
+            timestamp: Date.now()
         });
 
+        // console.log(`Redirecting to custom scheme with sessionId: ${sessionId}`);
+        // console.log(`Target URL: ${appCallbackUrl}`);
+
+        // 7. Redirect to App via HTML Page (More reliable for mobile deep links)
+        // Ensure we handle cases where appCallbackUrl might already have params (though unlikely with createURL)
+        const separator = appCallbackUrl.includes('?') ? '&' : '?';
+        const deepLink = `${appCallbackUrl}${separator}status=success&sessionId=${sessionId}`;
+
+        const html = `
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Redirecting...</title>
+                <meta name="viewport" content="width=device-width, initial-scale=1">
+                <style>
+                    body { font-family: sans-serif; text-align: center; padding: 20px; display: flex; flex-direction: column; justify-content: center; height: 100vh; }
+                    .btn { display: inline-block; padding: 12px 24px; background-color: #007bff; color: white; text-decoration: none; border-radius: 5px; font-weight: bold; margin-top: 20px;}
+                </style>
+            </head>
+            <body>
+                <h2>Verification Successful!</h2>
+                <p>You can now return to the app.</p>
+                <a href="${deepLink}" class="btn">Return to App</a>
+                <script>
+                    setTimeout(function() {
+                        window.location.href = "${deepLink}";
+                    }, 100);
+                </script>
+            </body>
+            </html>
+        `;
+
+        res.send(html);
+
     } catch (error) {
-        console.error("Token Exchange Failed:", error.message);
-        if (error.response) console.error("Details:", error.response.data);
-        res.status(500).json({ success: false, message: "Token exchange failed: " + error.message });
+        console.error("OAuth failed", error.message);
+        if (error.response) {
+            console.error("Details:", error.response.data);
+        }
+        res.redirect('driivera://digilocker?status=error&error=oauth_failed');
     }
 };
 

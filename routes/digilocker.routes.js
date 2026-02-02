@@ -6,8 +6,7 @@ const multer = require('multer');
 const upload = multer({ storage: multer.memoryStorage() });
 
 router.get('/initiate', digilockerController.initiateAuth);
-router.get('/callback', digilockerController.handleCallback); // Now just a redirector
-router.post('/exchange-token', digilockerController.exchangeToken); // New local logic
+router.get('/callback', digilockerController.handleCallback);
 router.get('/session/:sessionId', digilockerController.getSession);
 router.post('/verify-match', digilockerController.verifyMatch);
 router.post('/finalize-verification', digilockerController.finalizeVerification);
